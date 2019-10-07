@@ -6,9 +6,9 @@ import chainer.links as L
 import chainer.functions as F
 from chainer import reporter
 from chainer import Variable
+from chainer.functions.array.reshape import reshape
 import cupy as cp
 import math
-
 
 
 # ひとまずここに書く（後でちゃんと直す予定）
@@ -20,7 +20,51 @@ sin_m = math.sin(m)
 th = math.cos(math.pi - m)
 mm = math.sin(math.pi - m) * m
 # ----------------------------------------
+# ResNet50(Fine-Tuning)
+def _global_average_pooling_2d(x):
+    n, channel, rows, cols = x.shape
+    h = F.average_pooling_2d(x, (rows, cols), stride=1)
+    h = reshape(h, (n, channel))
+    return h
 
+
+class ResNet50Fine(chainer.Chain):
+    def __init__(self, num_class=10):
+        super(ResNet50Fine, self).__init__()
+
+        with self.init_scope():
+            self.base = L.ResNet50Layers()
+            self.fc = L.Linear(None, num_class)
+            self.weight = chainer.Parameter(chainer.initializers.Normal(scale=0.01), (num_class, 2048))
+
+    def __call__(self, x, t):
+        h = self.base(x, layers=['res5'])['res5']
+        self.cam = h
+        h = _global_average_pooling_2d(h)
+        ################################################################################
+        #                           ResNet50の後ろにArcFace実装
+        ################################################################################
+        # --------------------------- cos(theta) & phi(theta) ---------------------------
+        cosine = F.linear(F.normalize(h), F.normalize(self.weight)) # fc8
+        sine = F.sqrt(F.clip((1.0 - F.square(cosine)),0, 1))
+        phi = cosine * cos_m - sine * sin_m
+        if easy_margin:
+            phi = F.where(cosine.data > 0, phi, cosine)
+        else:
+            phi = F.where(cosine.data > th, phi, cosine - mm)
+        # --------------------------- convert label to one-hot ---------------------------
+        one_hot = cp.eye(10)[t].astype(cp.float32)
+        one_hot = Variable(one_hot)
+        # -------------torch.where(out_i = {x_i if condition_i else y_i) -------------
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        output *= s
+        ################################################################################
+        #h = self.fc(h)
+
+        return output
+
+
+"""
 class VGG16Fine(chainer.Chain):
     def __init__(self, num_class=10):
         w = chainer.initializers.Normal(scale=0.01)
@@ -44,9 +88,9 @@ class VGG16Fine(chainer.Chain):
 
         h = F.dropout(h, ratio=0.5)
         h = self.fc7(h)
-        h = F.relu(h)
+        #h = F.relu(h)
 
-        h = F.dropout(h, ratio=0.5)
+        #h = F.dropout(h, ratio=0.5)
         #h = self.fc8(h)
 
         ################################################################################
@@ -55,22 +99,22 @@ class VGG16Fine(chainer.Chain):
         # --------------------------- cos(theta) & phi(theta) ---------------------------
         cosine = F.linear(F.normalize(h), F.normalize(self.weight)) # fc8
         sine = F.sqrt(F.clip((1.0 - F.square(cosine)),0, 1))
+        #print(self.weight)
         phi = cosine * cos_m - sine * sin_m
         if easy_margin:
             phi = F.where(cosine.data > 0, phi, cosine)
         else:
-            phi = F.where(cosine.data > th, phi, cosine.data - mm)
+            phi = F.where(cosine.data > th, phi, cosine - mm)
         # --------------------------- convert label to one-hot ---------------------------
         one_hot = cp.eye(10)[t].astype(cp.float32)
         one_hot = Variable(one_hot)
         # -------------torch.where(out_i = {x_i if condition_i else y_i) -------------
         output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
-        output = phi
         output *= s
         ################################################################################
 
         return output
-
+"""
 
 
 class ArcFaceClassifer(L.Classifier):
@@ -78,7 +122,6 @@ class ArcFaceClassifer(L.Classifier):
                  lossfun=F.softmax_cross_entropy,
                  accfun=F.accuracy,):
         super().__init__(predictor=predictor, lossfun=lossfun, accfun=accfun)
-        self.predictor = predictor
 
     def forward(self, x, t):
         if not chainer.config.train:
